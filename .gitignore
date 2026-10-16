@@ -1,0 +1,13 @@
+/build/
+/*.elf
+/*.nacp
+/*.nro
+/*.lst
+*.d
+*.o
+.DS_Store
+Thumbs.db
+/_legacy_phase1/
+/_legacy_phase2/
+/_legacy_sdl/
+/release/
