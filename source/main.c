@@ -9,6 +9,15 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#define STBI_NO_STDIO
+#define STBI_ONLY_JPEG
+#define STBI_ONLY_PNG
+#define STBI_ONLY_GIF
+#define STBI_ONLY_BMP
+#define STBI_MAX_DIMENSIONS 2048
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
 #define SCREEN_W 1280
 #define SCREEN_H 720
 #define MAX_CHATS 8
@@ -17,7 +26,11 @@
 #define MESSAGE_SIZE 8192
 #define HTTP_SIZE (256 * 1024)
 #define THEME_COUNT 6
-#define CLIENT_USER_AGENT "Switch-AI-Chat/0.9.3"
+#define MAX_IMAGE_CACHE 4
+#define MAX_IMAGE_BYTES (5 * 1024 * 1024)
+#define MAX_IMAGE_PIXELS (2 * 1024 * 1024)
+#define IMAGE_PLACEHOLDER_H 150
+#define CLIENT_USER_AGENT "Switch-AI-Chat/0.9.4"
 
 typedef struct {
     char role[12];
@@ -37,6 +50,7 @@ typedef struct {
     char api_key[512];
     char model[160];
     int theme_id;
+    int web_search;
 } AppConfig;
 
 typedef enum { VIEW_CHAT, VIEW_SETTINGS, VIEW_MODELS } View;
@@ -61,6 +75,23 @@ typedef struct {
     int user;
 } BubbleCache;
 
+typedef enum { IMAGE_EMPTY, IMAGE_LOADING, IMAGE_READY, IMAGE_FAILED } ImageState;
+
+typedef struct {
+    char url[1024];
+    unsigned char *data;
+    size_t length;
+    size_t capacity;
+    SDL_Texture *texture;
+    CURL *easy;
+    ImageState state;
+    int width;
+    int height;
+    int too_large;
+    unsigned last_used;
+    char error[96];
+} ImageEntry;
+
 static const char *CONFIG_DIR = "sdmc:/switch/SwitchAIChat";
 static const char *CONFIG_PATH = "sdmc:/switch/SwitchAIChat/config.ini";
 static const char *SESSIONS_PATH = "sdmc:/switch/SwitchAIChat/sessions.bin";
@@ -84,6 +115,10 @@ static int height_cache_width[MAX_CHATS][MAX_MESSAGES];
 static int height_cache_value[MAX_CHATS][MAX_MESSAGES];
 static BubbleCache bubble_cache[MAX_CHATS][MAX_MESSAGES];
 static int bubble_cache_chat=-1;
+static ImageEntry image_cache[MAX_IMAGE_CACHE];
+static CURLM *image_multi;
+static unsigned image_frame;
+static unsigned image_layout_revision=1;
 static View current_view = VIEW_CHAT;
 static char status_text[256] = "ZR 打开设置";
 static TTF_Font *live_font;
@@ -92,6 +127,7 @@ static TTF_Font *live_emoji;
 
 static void draw_chat(SDL_Renderer *r, TTF_Font *font, TTF_Font *small, Theme t);
 static void destroy_bubble_cache(void);
+static void cleanup_image_cache(void);
 
 void userAppInit(void) {
     Result rc = plInitialize(PlServiceType_User);
@@ -210,6 +246,7 @@ static void load_config(void) {
         else if (!strcmp(line, "api_key")) snprintf(config.api_key, sizeof(config.api_key), "%s", equals);
         else if (!strcmp(line, "model")) snprintf(config.model, sizeof(config.model), "%s", equals);
         else if (!strcmp(line, "theme")) config.theme_id = atoi(equals);
+        else if (!strcmp(line, "web_search")) config.web_search = atoi(equals) != 0;
         else if (!strcmp(line, "dark_mode")) config.theme_id = atoi(equals) ? 0 : 1;
     }
     fclose(file);
@@ -220,8 +257,9 @@ static int save_config(void) {
     mkdir(CONFIG_DIR, 0777);
     FILE *file = fopen(CONFIG_PATH, "w");
     if (!file) return 0;
-    fprintf(file, "base_url=%s\napi_key=%s\nmodel=%s\ntheme=%d\n",
-            config.base_url, config.api_key, config.model, config.theme_id);
+    fprintf(file, "base_url=%s\napi_key=%s\nmodel=%s\ntheme=%d\nweb_search=%d\n",
+            config.base_url, config.api_key, config.model, config.theme_id,
+            config.web_search ? 1 : 0);
     fclose(file);
     return 1;
 }
@@ -438,6 +476,132 @@ static int http_request(const char *url, const char *post_data, char *response,
     return 1;
 }
 
+static int ends_with_ignore_case(const char *value,const char *suffix) {
+    size_t a=strlen(value),b=strlen(suffix);if(a<b)return 0;
+    for(size_t i=0;i<b;i++)if(tolower((unsigned char)value[a-b+i])!=tolower((unsigned char)suffix[i]))return 0;
+    return 1;
+}
+
+static int image_url_is_safe(const char *url,char *error,size_t error_size) {
+    const char *authority=NULL;
+    if(!strncmp(url,"https://",8))authority=url+8;
+    else if(!strncmp(url,"http://",7))authority=url+7;
+    else {snprintf(error,error_size,"仅支持 HTTP/HTTPS 图片");return 0;}
+    const char *end=authority+strcspn(authority,"/?#");
+    if(end==authority||(size_t)(end-authority)>=256||memchr(authority,'@',(size_t)(end-authority))){snprintf(error,error_size,"图片地址无效");return 0;}
+    char host[256];size_t length=(size_t)(end-authority);memcpy(host,authority,length);host[length]=0;
+    if(host[0]=='['){char *close=strchr(host,']');if(!close){snprintf(error,error_size,"图片主机无效");return 0;}close[1]=0;}
+    else {char *port=strrchr(host,':');if(port)*port=0;}
+    for(char *p=host;*p;p++)*p=(char)tolower((unsigned char)*p);
+    if(!strcmp(host,"localhost")||ends_with_ignore_case(host,".local")||!strncmp(host,"127.",4)||!strncmp(host,"10.",3)||!strncmp(host,"192.168.",8)||!strncmp(host,"169.254.",8)||!strncmp(host,"0.",2)||!strcmp(host,"[::1]")||!strncmp(host,"[fc",3)||!strncmp(host,"[fd",3)||!strncmp(host,"[fe80",5)){
+        snprintf(error,error_size,"已阻止本地网络图片地址");return 0;
+    }
+    return 1;
+}
+
+static void invalidate_message_layout(void) {
+    memset(height_cache_hash,0,sizeof(height_cache_hash));
+    memset(height_cache_width,0,sizeof(height_cache_width));
+    image_layout_revision++;
+    if(!image_layout_revision)image_layout_revision=1;
+    destroy_bubble_cache();
+}
+
+static void reset_image_entry(ImageEntry *entry) {
+    if(entry->easy&&image_multi)curl_multi_remove_handle(image_multi,entry->easy);
+    if(entry->easy)curl_easy_cleanup(entry->easy);
+    if(entry->texture)SDL_DestroyTexture(entry->texture);
+    free(entry->data);memset(entry,0,sizeof(*entry));
+}
+
+static size_t image_write(void *contents,size_t size,size_t count,void *user) {
+    ImageEntry *entry=user;size_t incoming=size*count;
+    if(!incoming)return 0;
+    if(entry->length+incoming>MAX_IMAGE_BYTES){entry->too_large=1;return 0;}
+    size_t needed=entry->length+incoming;
+    if(needed>entry->capacity){size_t capacity=entry->capacity?entry->capacity:65536;while(capacity<needed&&capacity<MAX_IMAGE_BYTES)capacity*=2;if(capacity>MAX_IMAGE_BYTES)capacity=MAX_IMAGE_BYTES;unsigned char *next=realloc(entry->data,capacity);if(!next)return 0;entry->data=next;entry->capacity=capacity;}
+    memcpy(entry->data+entry->length,contents,incoming);entry->length+=incoming;return incoming;
+}
+
+static ImageEntry *find_image_entry(const char *url) {
+    for(int i=0;i<MAX_IMAGE_CACHE;i++)if(image_cache[i].state!=IMAGE_EMPTY&&!strcmp(image_cache[i].url,url)){image_cache[i].last_used=image_frame;return &image_cache[i];}
+    return NULL;
+}
+
+static ImageEntry *start_image_download(const char *url) {
+    ImageEntry *existing=find_image_entry(url);if(existing)return existing;
+    ImageEntry *entry=NULL;
+    for(int i=0;i<MAX_IMAGE_CACHE;i++)if(image_cache[i].state==IMAGE_EMPTY){entry=&image_cache[i];break;}
+    if(!entry){for(int i=0;i<MAX_IMAGE_CACHE;i++)if(image_cache[i].state!=IMAGE_LOADING&&(!entry||image_cache[i].last_used<entry->last_used))entry=&image_cache[i];}
+    if(!entry)return NULL;
+    reset_image_entry(entry);snprintf(entry->url,sizeof(entry->url),"%s",url);entry->last_used=image_frame;
+    if(!image_url_is_safe(url,entry->error,sizeof(entry->error))){entry->state=IMAGE_FAILED;return entry;}
+    if(!image_multi)image_multi=curl_multi_init();
+    entry->easy=curl_easy_init();
+    if(!image_multi||!entry->easy){snprintf(entry->error,sizeof(entry->error),"无法初始化图片下载");entry->state=IMAGE_FAILED;return entry;}
+    entry->state=IMAGE_LOADING;
+    curl_easy_setopt(entry->easy,CURLOPT_URL,entry->url);
+    curl_easy_setopt(entry->easy,CURLOPT_WRITEFUNCTION,image_write);
+    curl_easy_setopt(entry->easy,CURLOPT_WRITEDATA,entry);
+    curl_easy_setopt(entry->easy,CURLOPT_PRIVATE,entry);
+    curl_easy_setopt(entry->easy,CURLOPT_USERAGENT,CLIENT_USER_AGENT);
+    curl_easy_setopt(entry->easy,CURLOPT_FOLLOWLOCATION,1L);
+    curl_easy_setopt(entry->easy,CURLOPT_MAXREDIRS,3L);
+    curl_easy_setopt(entry->easy,CURLOPT_PROTOCOLS,(long)(CURLPROTO_HTTP|CURLPROTO_HTTPS));
+    curl_easy_setopt(entry->easy,CURLOPT_REDIR_PROTOCOLS,(long)(CURLPROTO_HTTP|CURLPROTO_HTTPS));
+    curl_easy_setopt(entry->easy,CURLOPT_CONNECTTIMEOUT,10L);
+    curl_easy_setopt(entry->easy,CURLOPT_TIMEOUT,45L);
+    curl_easy_setopt(entry->easy,CURLOPT_MAXFILESIZE_LARGE,(curl_off_t)MAX_IMAGE_BYTES);
+    curl_easy_setopt(entry->easy,CURLOPT_ACCEPT_ENCODING,"");
+    curl_easy_setopt(entry->easy,CURLOPT_NOSIGNAL,1L);
+    if(curl_multi_add_handle(image_multi,entry->easy)!=CURLM_OK){curl_easy_cleanup(entry->easy);entry->easy=NULL;entry->state=IMAGE_FAILED;snprintf(entry->error,sizeof(entry->error),"无法加入图片下载队列");}
+    return entry;
+}
+
+static void finish_image_download(ImageEntry *entry,CURLcode result,SDL_Renderer *renderer) {
+    long status=0;if(entry->easy)curl_easy_getinfo(entry->easy,CURLINFO_RESPONSE_CODE,&status);
+    if(entry->easy&&image_multi)curl_multi_remove_handle(image_multi,entry->easy);
+    if(entry->easy)curl_easy_cleanup(entry->easy);
+    entry->easy=NULL;
+    if(result!=CURLE_OK||status<200||status>=300){entry->state=IMAGE_FAILED;if(entry->too_large)snprintf(entry->error,sizeof(entry->error),"图片超过 5 MiB 限制");else snprintf(entry->error,sizeof(entry->error),"下载失败（HTTP %ld）",status);free(entry->data);entry->data=NULL;entry->length=entry->capacity=0;invalidate_message_layout();return;}
+    int width=0,height=0,channels=0;
+    if(!stbi_info_from_memory(entry->data,(int)entry->length,&width,&height,&channels)||width<1||height<1||width>2048||height>2048||(long long)width*height>MAX_IMAGE_PIXELS){entry->state=IMAGE_FAILED;snprintf(entry->error,sizeof(entry->error),"图片格式或尺寸不受支持");free(entry->data);entry->data=NULL;entry->length=entry->capacity=0;invalidate_message_layout();return;}
+    unsigned char *pixels=stbi_load_from_memory(entry->data,(int)entry->length,&width,&height,&channels,STBI_rgb_alpha);
+    if(!pixels){entry->state=IMAGE_FAILED;snprintf(entry->error,sizeof(entry->error),"图片解码失败");free(entry->data);entry->data=NULL;entry->length=entry->capacity=0;invalidate_message_layout();return;}
+    SDL_Surface *source=SDL_CreateRGBSurfaceWithFormatFrom(pixels,width,height,32,width*4,SDL_PIXELFORMAT_RGBA32);
+    SDL_Surface *scaled=NULL;int texture_width=width,texture_height=height;
+    if(source&&(texture_width>960||texture_height>512)){
+        double ratio_w=960.0/texture_width,ratio_h=512.0/texture_height,ratio=ratio_w<ratio_h?ratio_w:ratio_h;
+        texture_width=(int)(texture_width*ratio);texture_height=(int)(texture_height*ratio);
+        if(texture_width<1)texture_width=1;
+        if(texture_height<1)texture_height=1;
+        scaled=SDL_CreateRGBSurfaceWithFormat(0,texture_width,texture_height,32,SDL_PIXELFORMAT_RGBA32);
+        if(scaled)SDL_BlitScaled(source,NULL,scaled,NULL);
+    }
+    SDL_Surface *texture_surface=scaled?scaled:source;
+    entry->texture=texture_surface?SDL_CreateTextureFromSurface(renderer,texture_surface):NULL;
+    if(scaled)SDL_FreeSurface(scaled);
+    if(source)SDL_FreeSurface(source);
+    stbi_image_free(pixels);free(entry->data);entry->data=NULL;entry->length=entry->capacity=0;
+    if(!entry->texture){entry->state=IMAGE_FAILED;snprintf(entry->error,sizeof(entry->error),"无法创建图片纹理");}
+    else {SDL_SetTextureBlendMode(entry->texture,SDL_BLENDMODE_BLEND);entry->state=IMAGE_READY;entry->width=texture_width;entry->height=texture_height;}
+    invalidate_message_layout();
+}
+
+static void pump_image_downloads(SDL_Renderer *renderer) {
+    image_frame++;
+    if(!image_multi)return;
+    int running=0;if(curl_multi_perform(image_multi,&running)!=CURLM_OK)return;
+    int queued=0;CURLMsg *message;
+    while((message=curl_multi_info_read(image_multi,&queued))){if(message->msg!=CURLMSG_DONE)continue;char *private_data=NULL;curl_easy_getinfo(message->easy_handle,CURLINFO_PRIVATE,&private_data);ImageEntry *entry=(ImageEntry *)private_data;if(entry)finish_image_download(entry,message->data.result,renderer);}
+}
+
+static void cleanup_image_cache(void) {
+    for(int i=0;i<MAX_IMAGE_CACHE;i++)reset_image_entry(&image_cache[i]);
+    if(image_multi)curl_multi_cleanup(image_multi);
+    image_multi=NULL;
+}
+
 static const char *skip_space(const char *p) {
     while (*p && isspace((unsigned char)*p)) p++;
     return p;
@@ -513,7 +677,9 @@ typedef struct {
     int saw_done;
     int saw_finish;
     int overflow;
+    int responses_mode;
     char finish_reason[32];
+    char server_error[160];
 } StreamContext;
 
 static void append_stream_text(StreamContext *ctx,const char *delta) {
@@ -522,8 +688,34 @@ static void append_stream_text(StreamContext *ctx,const char *delta) {
     if(add){memcpy(ctx->assistant->text+have,delta,add);ctx->assistant->text[have+add]=0;}
 }
 
+static void append_stream_image(StreamContext *ctx,const char *url) {
+    if(!url[0]||strstr(ctx->assistant->text,url))return;
+    char markdown[1200];snprintf(markdown,sizeof(markdown),"\n\n![模型返回图片](%s)\n",url);
+    append_stream_text(ctx,markdown);
+}
+
 static void process_stream_json(StreamContext *ctx,const char *json) {
     if(!strcmp(json,"[DONE]")){ctx->saw_done=1;return;}
+    if(ctx->responses_mode){
+        char event_type[64];event_type[0]=0;
+        json_string_after(json,"\"type\"",event_type,sizeof(event_type));
+        if(!strcmp(event_type,"response.completed")){ctx->saw_done=1;return;}
+        if(!strcmp(event_type,"response.incomplete")){ctx->saw_finish=1;snprintf(ctx->finish_reason,sizeof(ctx->finish_reason),"length");return;}
+        if(!strcmp(event_type,"response.failed")||!strcmp(event_type,"error")){
+            if(!json_string_after(json,"\"message\"",ctx->server_error,sizeof(ctx->server_error)))
+                snprintf(ctx->server_error,sizeof(ctx->server_error),"Responses 请求失败");
+            return;
+        }
+        if(!strcmp(event_type,"response.output_text.delta")){
+            char delta[8192];
+            if(json_string_after(json,"\"delta\"",delta,sizeof(delta))&&delta[0]){
+                append_stream_text(ctx,delta);ctx->chat->scroll_y=1000000;
+                snprintf(status_text,sizeof(status_text),"正在生成 · %u 字节",(unsigned)strlen(ctx->assistant->text));
+            }
+            return;
+        }
+        return;
+    }
     char reason[32];
     if(json_string_after(json,"\"finish_reason\"",reason,sizeof(reason))){ctx->saw_finish=1;snprintf(ctx->finish_reason,sizeof(ctx->finish_reason),"%s",reason);}
     char delta[8192];
@@ -531,6 +723,23 @@ static void process_stream_json(StreamContext *ctx,const char *json) {
         append_stream_text(ctx,delta);ctx->chat->scroll_y=1000000;
         snprintf(status_text,sizeof(status_text),"正在生成 · %u 字节",(unsigned)strlen(ctx->assistant->text));
     }
+    const char *image_part=strstr(json,"\"image_url\"");
+    if(image_part){char image_url[1024];if(json_string_after(image_part,"\"url\"",image_url,sizeof(image_url))&&image_url[0]){append_stream_image(ctx,image_url);ctx->chat->scroll_y=1000000;}}
+}
+
+static int contains_ignore_case(const char *value,const char *needle) {
+    if(!value||!needle||!*needle)return 0;
+    size_t length=strlen(needle);
+    for(const char *p=value;*p;p++){
+        size_t i=0;
+        while(i<length&&p[i]&&tolower((unsigned char)p[i])==tolower((unsigned char)needle[i]))i++;
+        if(i==length)return 1;
+    }
+    return 0;
+}
+
+static int provider_is_minimax(void) {
+    return contains_ignore_case(config.base_url,"minimax")||contains_ignore_case(config.model,"minimax");
 }
 
 static size_t stream_write(void *contents,size_t size,size_t count,void *user) {
@@ -589,6 +798,7 @@ static void finish_active_request(CURLcode result,int stopped) {
     if(active_stream->pending_length){active_stream->pending[active_stream->pending_length]=0;const char *tail=skip_space(active_stream->pending);if(!strncmp(tail,"data:",5))tail=skip_space(tail+5);process_stream_json(active_stream,tail);}
     if(stopped)snprintf(status_text,sizeof(status_text),"已停止生成，已保留当前内容");
     else if(result!=CURLE_OK||http<200||http>=300)snprintf(status_text,sizeof(status_text),"请求失败：%s（HTTP %ld）",curl_easy_strerror(result),http);
+    else if(active_stream->server_error[0])snprintf(status_text,sizeof(status_text),"服务端错误：%.190s",active_stream->server_error);
     else if(active_stream->overflow)snprintf(status_text,sizeof(status_text),"回复超过本地容量，已截断");
     else if(active_stream->saw_finish&&!strcmp(active_stream->finish_reason,"length"))snprintf(status_text,sizeof(status_text),"模型达到输出上限，回复未完成");
     else if(!active_stream->saw_done&&!active_stream->saw_finish)snprintf(status_text,sizeof(status_text),"连接已结束，但未收到完成标记");
@@ -618,13 +828,24 @@ static int send_chat(const char *prompt) {
     Chat *chat=&chats[active_chat];
     if(chat->message_count+2>MAX_MESSAGES){snprintf(status_text,sizeof(status_text),"当前会话消息已满");return 0;}
     char *escaped=malloc(MESSAGE_SIZE*2),*body=calloc(1,HTTP_SIZE);if(!escaped||!body){free(escaped);free(body);snprintf(status_text,sizeof(status_text),"内存不足");return 0;}
-    size_t used=(size_t)snprintf(body,HTTP_SIZE,"{\"model\":\"%s\",\"stream\":true,\"max_tokens\":2048,\"messages\":[{\"role\":\"system\",\"content\":\"请直接、完整地回答用户问题，不要用以后可以补充之类的话提前结束。用户要求参数表或对照表时，必须在当前回复中给出完整 Markdown 表格。\"}",config.model);
-    for(int i=0;i<chat->message_count;i++){json_escape(chat->messages[i].text,escaped,MESSAGE_SIZE*2);used+=(size_t)snprintf(body+used,HTTP_SIZE-used,",{\"role\":\"%s\",\"content\":\"%s\"}",chat->messages[i].role,escaped);}
-    json_escape(prompt,escaped,MESSAGE_SIZE*2);snprintf(body+used,HTTP_SIZE-used,",{\"role\":\"user\",\"content\":\"%s\"}]}",escaped);free(escaped);
+    int responses_mode=config.web_search&&provider_is_minimax();
+    const char *instruction="请直接、完整地回答用户问题，不要用以后可以补充之类的话提前结束。用户要求参数表或对照表时，必须在当前回复中给出完整 Markdown 表格。图片请使用 Markdown 图片语法并提供可公开访问的 HTTPS 地址。";
+    size_t used;
+    if(responses_mode){
+        used=(size_t)snprintf(body,HTTP_SIZE,"{\"model\":\"%s\",\"stream\":true,\"max_output_tokens\":2048,\"instructions\":\"%s\",\"input\":[",config.model,instruction);
+        for(int i=0;i<chat->message_count;i++){json_escape(chat->messages[i].text,escaped,MESSAGE_SIZE*2);used+=(size_t)snprintf(body+used,HTTP_SIZE-used,"%s{\"role\":\"%s\",\"content\":\"%s\"}",i?",":"",chat->messages[i].role,escaped);}
+        json_escape(prompt,escaped,MESSAGE_SIZE*2);used+=(size_t)snprintf(body+used,HTTP_SIZE-used,"%s{\"role\":\"user\",\"content\":\"%s\"}],\"tools\":[{\"type\":\"web_search\"}]}",chat->message_count?",":"",escaped);
+    }else{
+        used=(size_t)snprintf(body,HTTP_SIZE,"{\"model\":\"%s\",\"stream\":true,\"max_tokens\":2048,\"messages\":[{\"role\":\"system\",\"content\":\"%s\"}",config.model,instruction);
+        for(int i=0;i<chat->message_count;i++){json_escape(chat->messages[i].text,escaped,MESSAGE_SIZE*2);used+=(size_t)snprintf(body+used,HTTP_SIZE-used,",{\"role\":\"%s\",\"content\":\"%s\"}",chat->messages[i].role,escaped);}
+        json_escape(prompt,escaped,MESSAGE_SIZE*2);used+=(size_t)snprintf(body+used,HTTP_SIZE-used,",{\"role\":\"user\",\"content\":\"%s\"}]%s}",escaped,config.web_search?",\"enable_search\":true":"");
+    }
+    free(escaped);
+    if(used>=HTTP_SIZE){free(body);snprintf(status_text,sizeof(status_text),"请求内容过长");return 0;}
     Message *user=&chat->messages[chat->message_count++]; strcpy(user->role,"user"); snprintf(user->text,sizeof(user->text),"%s",prompt);
     Message *assistant=&chat->messages[chat->message_count++]; strcpy(assistant->role,"assistant");assistant->text[0]=0;
     if(chat->message_count==2) snprintf(chat->title,sizeof(chat->title),"%.42s",prompt);
-    active_stream=calloc(1,sizeof(*active_stream));active_easy=curl_easy_init();active_multi=curl_multi_init();if(!active_stream||!active_easy||!active_multi){free(body);chat->message_count-=2;cleanup_active_request();snprintf(status_text,sizeof(status_text),"无法初始化异步网络请求");return 0;}active_body=body;active_stream->assistant=assistant;active_stream->chat=chat;char url[640];endpoint_url(url,sizeof(url),"chat/completions");active_headers=curl_slist_append(active_headers,"Accept: text/event-stream");active_headers=curl_slist_append(active_headers,"Content-Type: application/json");char auth[640];if(config.api_key[0]){snprintf(auth,sizeof(auth),"Authorization: Bearer %s",config.api_key);active_headers=curl_slist_append(active_headers,auth);}curl_easy_setopt(active_easy,CURLOPT_URL,url);curl_easy_setopt(active_easy,CURLOPT_HTTPHEADER,active_headers);curl_easy_setopt(active_easy,CURLOPT_POSTFIELDS,active_body);curl_easy_setopt(active_easy,CURLOPT_WRITEFUNCTION,stream_write);curl_easy_setopt(active_easy,CURLOPT_WRITEDATA,active_stream);curl_easy_setopt(active_easy,CURLOPT_BUFFERSIZE,1024L);curl_easy_setopt(active_easy,CURLOPT_TCP_NODELAY,1L);curl_easy_setopt(active_easy,CURLOPT_CONNECTTIMEOUT,15L);curl_easy_setopt(active_easy,CURLOPT_TIMEOUT,120L);curl_easy_setopt(active_easy,CURLOPT_USERAGENT,CLIENT_USER_AGENT);if(curl_multi_add_handle(active_multi,active_easy)!=CURLM_OK){chat->message_count-=2;cleanup_active_request();snprintf(status_text,sizeof(status_text),"无法加入异步网络队列");return 0;}chat->scroll_y=1000000;cancel_requested=0;is_generating=1;snprintf(status_text,sizeof(status_text),"正在连接 %s……",config.model);return 1;
+    active_stream=calloc(1,sizeof(*active_stream));active_easy=curl_easy_init();active_multi=curl_multi_init();if(!active_stream||!active_easy||!active_multi){free(body);chat->message_count-=2;cleanup_active_request();snprintf(status_text,sizeof(status_text),"无法初始化异步网络请求");return 0;}active_body=body;active_stream->assistant=assistant;active_stream->chat=chat;active_stream->responses_mode=responses_mode;char url[640];endpoint_url(url,sizeof(url),responses_mode?"responses":"chat/completions");active_headers=curl_slist_append(active_headers,"Accept: text/event-stream");active_headers=curl_slist_append(active_headers,"Content-Type: application/json");char auth[640];if(config.api_key[0]){snprintf(auth,sizeof(auth),"Authorization: Bearer %s",config.api_key);active_headers=curl_slist_append(active_headers,auth);}curl_easy_setopt(active_easy,CURLOPT_URL,url);curl_easy_setopt(active_easy,CURLOPT_HTTPHEADER,active_headers);curl_easy_setopt(active_easy,CURLOPT_POSTFIELDS,active_body);curl_easy_setopt(active_easy,CURLOPT_WRITEFUNCTION,stream_write);curl_easy_setopt(active_easy,CURLOPT_WRITEDATA,active_stream);curl_easy_setopt(active_easy,CURLOPT_BUFFERSIZE,1024L);curl_easy_setopt(active_easy,CURLOPT_TCP_NODELAY,1L);curl_easy_setopt(active_easy,CURLOPT_CONNECTTIMEOUT,15L);curl_easy_setopt(active_easy,CURLOPT_TIMEOUT,120L);curl_easy_setopt(active_easy,CURLOPT_USERAGENT,CLIENT_USER_AGENT);if(curl_multi_add_handle(active_multi,active_easy)!=CURLM_OK){chat->message_count-=2;cleanup_active_request();snprintf(status_text,sizeof(status_text),"无法加入异步网络队列");return 0;}chat->scroll_y=1000000;cancel_requested=0;is_generating=1;snprintf(status_text,sizeof(status_text),config.web_search?"正在联网搜索并生成……":"正在连接 %s……",config.model);return 1;
 }
 
 static void clean_markdown_inline(const char *input, char *output, size_t size) {
@@ -691,6 +912,38 @@ static int draw_mermaid(SDL_Renderer *r,TTF_Font *font,char **lines,int start,in
     return diagram_h;
 }
 
+static int parse_markdown_image_line(const char *line,char *alt,size_t alt_size,char *url,size_t url_size) {
+    while(*line&&isspace((unsigned char)*line))line++;
+    if(strncmp(line,"![",2))return 0;
+    const char *label_end=strstr(line+2,"](");if(!label_end)return 0;
+    const char *url_start=label_end+2,*url_end=strrchr(url_start,')');if(!url_end)return 0;
+    const char *tail=url_end+1;while(*tail&&isspace((unsigned char)*tail))tail++;if(*tail)return 0;
+    while(url_start<url_end&&isspace((unsigned char)*url_start))url_start++;
+    while(url_end>url_start&&isspace((unsigned char)url_end[-1]))url_end--;
+    if(url_end>url_start+1&&url_start[0]=='<'&&url_end[-1]=='>'){url_start++;url_end--;}
+    size_t label_len=(size_t)(label_end-(line+2));if(label_len>=alt_size)label_len=alt_size-1;memcpy(alt,line+2,label_len);alt[label_len]=0;
+    size_t url_len=(size_t)(url_end-url_start);if(!url_len||url_len>=url_size)return 0;memcpy(url,url_start,url_len);url[url_len]=0;
+    return 1;
+}
+
+static int markdown_contains_image(const char *text) {
+    const char *line=text;
+    while(line&&*line){while(*line==' '||*line=='\t')line++;if(!strncmp(line,"![",2))return 1;line=strchr(line,'\n');if(line)line++;}
+    return 0;
+}
+
+static int draw_markdown_image(SDL_Renderer *r,TTF_Font *font,const char *alt,const char *url,int x,int y,int width,Theme t) {
+    ImageEntry *entry=start_image_download(url);int image_h=IMAGE_PLACEHOLDER_H,display_w=width,display_h=IMAGE_PLACEHOLDER_H;
+    if(entry&&entry->state==IMAGE_READY&&entry->width>0&&entry->height>0){display_w=entry->width<width?entry->width:width;display_h=(int)((long long)entry->height*display_w/entry->width);if(display_h>330){display_w=(int)((long long)display_w*330/display_h);display_h=330;}if(display_h<1)display_h=1;image_h=display_h;}
+    int caption_h=alt[0]?draw_wrapped(NULL,font,alt,0,0,width-24,t.muted)+8:0;int total=image_h+caption_h+20;
+    if(!r)return total;
+    Uint8 image_bg[3]={t.panel[0],t.panel[1],t.panel[2]};fill_rounded(r,x,y,width,total,12,image_bg);
+    if(entry&&entry->state==IMAGE_READY&&entry->texture){SDL_Rect target={x+(width-display_w)/2,y+10,display_w,display_h};SDL_RenderCopy(r,entry->texture,NULL,&target);}
+    else {const char *label="正在加载图片…";SDL_Color color=t.accent;if(!entry){label="图片缓存暂时不可用";color=t.danger;}else if(entry->state==IMAGE_FAILED){label=entry->error[0]?entry->error:"图片加载失败";color=t.danger;}draw_text(r,font,label,x+18,y+18,color);draw_wrapped(r,font,url,x+18,y+58,width-36,t.muted);}
+    if(alt[0])draw_wrapped(r,font,alt,x+12,y+10+image_h,width-24,t.muted);
+    return total;
+}
+
 static int draw_markdown(SDL_Renderer *r, TTF_Font *font, TTF_Font *small,
                          const char *source, int x, int y, int width, Theme t) {
     char buffer[MESSAGE_SIZE];strip_think_blocks(source,buffer,sizeof(buffer));
@@ -698,6 +951,8 @@ static int draw_markdown(SDL_Renderer *r, TTF_Font *font, TTF_Font *small,
     int cursor=y;
     for(int index=0;index<line_count;index++){
         char *line=lines[index];
+        char image_alt[160],image_url[1024];
+        if(parse_markdown_image_line(line,image_alt,sizeof(image_alt),image_url,sizeof(image_url))){cursor+=draw_markdown_image(r,small,image_alt,image_url,x,cursor,width,t)+8;continue;}
         if(strchr(line,'|')&&index+1<line_count&&table_separator(lines[index+1])){
             char header_copy[MESSAGE_SIZE];snprintf(header_copy,sizeof(header_copy),"%s",line);char *cells[8];int columns=split_cells(header_copy,cells,8);cursor+=draw_table_row(r,small,cells,columns,x,cursor,width,t,1);index+=2;
             while(index<line_count&&strchr(lines[index],'|')){char row_copy[MESSAGE_SIZE];snprintf(row_copy,sizeof(row_copy),"%s",lines[index]);char *row_cells[8];int row_count=split_cells(row_copy,row_cells,8);while(row_count<columns)row_cells[row_count++]="";cursor+=draw_table_row(r,small,row_cells,columns,x,cursor,width,t,0);index++;}index--;cursor+=8;continue;
@@ -734,6 +989,7 @@ static unsigned text_hash(const char *text) {
 
 static int cached_message_height(int chat_index,int message_index,TTF_Font *small,int width) {
     unsigned hash=text_hash(chats[chat_index].messages[message_index].text);
+    if(markdown_contains_image(chats[chat_index].messages[message_index].text))hash^=image_layout_revision*16777619u;
     if(height_cache_hash[chat_index][message_index]!=hash||height_cache_width[chat_index][message_index]!=width){height_cache_hash[chat_index][message_index]=hash;height_cache_width[chat_index][message_index]=width;height_cache_value[chat_index][message_index]=message_height(small,chats[chat_index].messages[message_index].text,width);}
     return height_cache_value[chat_index][message_index];
 }
@@ -793,6 +1049,10 @@ static void draw_chat(SDL_Renderer *r, TTF_Font *font, TTF_Font *small, Theme t)
     draw_sidebar_chevron(r,side,358,sidebar_collapsed,t.text);
     for(int i=0;i<chat_count;i++){int row_y=88+i*68;if(i==active_chat){fill_rounded(r,10,row_y-7,side-20,60,12,t.selected);fill(r,10,row_y-7,4,60,accent_fill);}if(!sidebar_collapsed){draw_text(r,small,chats[i].title,26,row_y,t.text);draw_text(r,small,chats[i].created_at,26,row_y+28,t.muted);}else draw_text(r,small,i==active_chat?"●":"○",25,row_y+9,i==active_chat?t.accent:t.muted);}
     draw_sidebar_actions(r,small,t,side);
+    int search_x=content_x+content_w-172;
+    Uint8 search_color[3]={config.web_search?t.accent.r:t.card[0],config.web_search?t.accent.g:t.card[1],config.web_search?t.accent.b:t.card[2]};
+    fill_rounded(r,search_x,46,172,34,12,search_color);
+    draw_text(r,small,config.web_search?"联网搜索：开":"联网搜索：关",search_x+18,51,config.web_search?(SDL_Color){255,255,255,255}:t.muted);
     if(chat_count<=0||active_chat<0){
         draw_text(r,font,"开始新对话",content_x,24,t.text);
         fill_rounded(r,content_x+10,112,content_w-20,170,20,t.card);
@@ -813,7 +1073,7 @@ static void draw_chat(SDL_Renderer *r, TTF_Font *font, TTF_Font *small, Theme t)
     if(!chat->message_count)draw_text(r,small,"按 A 输入消息；上下键或触摸拖动滚动",content_x,115,t.muted);
     SDL_Rect clip={content_x,viewport_top,content_w,viewport_bottom-viewport_top};SDL_RenderSetClipRect(r,&clip);
     int y=viewport_top-chat->scroll_y;
-    for(int i=0;i<chat->message_count;i++){int user=!strcmp(chat->messages[i].role,"user");int bubble_w=user?content_w*3/4:content_w*17/20;int bx=user?content_x+content_w-bubble_w-10:content_x+10;int card_h=cached_message_height(active_chat,i,small,bubble_w);if(y+card_h>=viewport_top&&y<=viewport_bottom){SDL_Texture *bubble=cached_bubble(r,active_chat,i,font,small,bubble_w,card_h,t,user);if(bubble){SDL_Rect target={bx,y,bubble_w,card_h};SDL_RenderCopy(r,bubble,NULL,&target);}else{Uint8 user_color[3]={t.selected[0],t.selected[1],t.selected[2]};fill_rounded(r,bx,y,bubble_w,card_h,16,user?user_color:t.card);draw_text(r,small,user?"你":"AI",bx+18,y+9,user?t.text:t.accent);draw_markdown(r,font,small,chat->messages[i].text,bx+18,y+36,bubble_w-36,t);}}y+=card_h+22;}
+    for(int i=0;i<chat->message_count;i++){int user=!strcmp(chat->messages[i].role,"user");int bubble_w=user?content_w*3/4:content_w*17/20;int bx=user?content_x+content_w-bubble_w-10:content_x+10;int card_h=cached_message_height(active_chat,i,small,bubble_w);if(y+card_h>=viewport_top&&y<=viewport_bottom){int has_image=markdown_contains_image(chat->messages[i].text);SDL_Texture *bubble=has_image?NULL:cached_bubble(r,active_chat,i,font,small,bubble_w,card_h,t,user);if(bubble){SDL_Rect target={bx,y,bubble_w,card_h};SDL_RenderCopy(r,bubble,NULL,&target);}else{Uint8 user_color[3]={t.selected[0],t.selected[1],t.selected[2]};fill_rounded(r,bx,y,bubble_w,card_h,16,user?user_color:t.card);draw_text(r,small,user?"你":"AI",bx+18,y+9,user?t.text:t.accent);draw_markdown(r,font,small,chat->messages[i].text,bx+18,y+36,bubble_w-36,t);}}y+=card_h+22;}
     SDL_RenderSetClipRect(r,NULL);
     if(max_scroll>0){int track_h=viewport_bottom-viewport_top;int thumb_h=track_h*track_h/(total?total:1);if(thumb_h<42)thumb_h=42;int thumb_y=viewport_top+(track_h-thumb_h)*chat->scroll_y/max_scroll;fill_rounded(r,SCREEN_W-18,viewport_top,5,track_h,2,t.card);fill_rounded(r,SCREEN_W-19,thumb_y,7,thumb_h,3,accent_fill);}
     draw_composer(r,small,t,content_x,content_w);
@@ -824,12 +1084,14 @@ static void masked_key(char *output,size_t size){size_t n=strlen(config.api_key)
 
 static void draw_settings(SDL_Renderer *r, TTF_Font *font, TTF_Font *small, Theme t) {
     fill(r,0,0,SCREEN_W,SCREEN_H,t.bg); draw_text(r,font,"设置",54,35,t.text);
-    const char *labels[]={"Base URL","API Key","获取可用模型","外观主题","返回聊天"};
-    char values[5][540]; char masked[64]; masked_key(masked,sizeof(masked));
+    const char *labels[]={"Base URL","API Key","获取可用模型","外观主题","联网搜索","返回聊天"};
+    char values[6][540]; char masked[64]; masked_key(masked,sizeof(masked));
     snprintf(values[0],sizeof(values[0]),"%s",config.base_url[0]?config.base_url:"未填写");
     snprintf(values[1],sizeof(values[1]),"%s",masked); snprintf(values[2],sizeof(values[2]),"当前模型：%s",config.model[0]?config.model:"未选择");
-    snprintf(values[3],sizeof(values[3]),"%s（A 切换）",theme_name()); snprintf(values[4],sizeof(values[4]),"保存并返回");
-    for(int i=0;i<5;i++){int y=120+i*92;if(i==setting_row)fill(r,42,y-12,1190,76,t.selected);draw_text(r,small,labels[i],70,y,t.text);draw_wrapped(r,small,values[i],330,y,860,i==setting_row?t.text:t.muted);}
+    snprintf(values[3],sizeof(values[3]),"%s（A 切换）",theme_name());
+    snprintf(values[4],sizeof(values[4]),"%s（MiniMax / 千问自动适配）",config.web_search?"已开启":"已关闭");
+    snprintf(values[5],sizeof(values[5]),"保存并返回");
+    for(int i=0;i<6;i++){int y=104+i*82;if(i==setting_row)fill(r,42,y-10,1190,68,t.selected);draw_text(r,small,labels[i],70,y,t.text);draw_wrapped(r,small,values[i],330,y,860,i==setting_row?t.text:t.muted);}
     draw_text(r,small,"方向键选择   A 编辑/确认   B 返回",55,640,t.muted); draw_wrapped(r,small,status_text,55,680,1160,t.accent);
 }
 
@@ -842,13 +1104,14 @@ static void draw_models(SDL_Renderer *r, TTF_Font *font, TTF_Font *small, Theme 
 
 static void handle_settings(u64 down) {
     if(down&HidNpadButton_Up && setting_row>0)setting_row--;
-    if(down&HidNpadButton_Down && setting_row<4)setting_row++;
+    if(down&HidNpadButton_Down && setting_row<5)setting_row++;
     if(down&HidNpadButton_B){save_config();current_view=VIEW_CHAT;return;}
     if(!(down&HidNpadButton_A))return;
     if(setting_row==0){if(keyboard_input(config.base_url,sizeof(config.base_url),"输入 Base URL",0)){save_config();snprintf(status_text,sizeof(status_text),"Base URL 已保存");}}
     else if(setting_row==1){if(keyboard_input(config.api_key,sizeof(config.api_key),"输入 API Key",1)){save_config();snprintf(status_text,sizeof(status_text),"API Key 已保存");}}
     else if(setting_row==2)fetch_models();
     else if(setting_row==3){if(config.theme_id<0||config.theme_id>=THEME_COUNT)config.theme_id=0;else config.theme_id=(config.theme_id+1)%THEME_COUNT;destroy_bubble_cache();save_config();snprintf(status_text,sizeof(status_text),"主题已切换为：%s",theme_name());}
+    else if(setting_row==4){config.web_search=!config.web_search;save_config();snprintf(status_text,sizeof(status_text),"联网搜索已%s",config.web_search?"开启":"关闭");}
     else {save_config();current_view=VIEW_CHAT;}
 }
 
@@ -865,15 +1128,17 @@ static u64 read_touch_action(int *touch_was_down) {
     *touch_was_down=1;touch_last_y=y;
     if(current_view==VIEW_CHAT){
         int side=sidebar_collapsed?72:330;
+        int content_x=side+40,content_w=SCREEN_W-content_x-45,search_x=content_x+content_w-172;
         if(x>=side-24&&x<=side+24&&y>=315&&y<=402){sidebar_collapsed=!sidebar_collapsed;return 0;}
         if(!sidebar_collapsed&&x<side&&y>=650&&y<=716)return x<side/2?HidNpadButton_X:HidNpadButton_ZR;
         if(sidebar_collapsed&&x<side&&y>=598&&y<657)return HidNpadButton_X;
         if(sidebar_collapsed&&x<side&&y>=657&&y<=716)return HidNpadButton_ZR;
+        if(x>=search_x&&x<=search_x+172&&y>=42&&y<=84){config.web_search=!config.web_search;save_config();snprintf(status_text,sizeof(status_text),"联网搜索已%s",config.web_search?"开启":"关闭");return 0;}
         if(chat_count>0&&x>side&&y<78)return HidNpadButton_ZL;
         if(x<side&&y>=83&&y<83+chat_count*68){int index=(y-83)/68;if(index>=0&&index<chat_count)active_chat=index;return 0;}
         if(x>side&&y>=548&&y<=630){if(x>=SCREEN_W-180)return HidNpadButton_B;return HidNpadButton_A;}
     } else if(current_view==VIEW_SETTINGS){
-        for(int i=0;i<5;i++){int top=108+i*92;if(y>=top&&y<top+80){setting_row=i;return HidNpadButton_A;}}
+        for(int i=0;i<6;i++){int top=94+i*82;if(y>=top&&y<top+70){setting_row=i;return HidNpadButton_A;}}
     } else {
         int first=selected_model-6;if(first<0)first=0;if(first>model_count-11)first=model_count-11;if(first<0)first=0;
         if(y>=85&&y<620){int row=(y-85)/48,index=first+row;if(index>=0&&index<model_count){selected_model=index;return HidNpadButton_A;}}
@@ -889,6 +1154,7 @@ int main(void) {
     if(R_FAILED(plGetSharedFontByType(&font_data,PlSharedFontType_ChineseSimplified))) return 1;
     int has_standard=R_SUCCEEDED(plGetSharedFontByType(&standard_data,PlSharedFontType_Standard));
     if(SDL_Init(SDL_INIT_VIDEO)!=0 || TTF_Init()!=0) return 1;
+    SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY,"1");
     SDL_Window *window=SDL_CreateWindow("Switch AI Chat",0,0,SCREEN_W,SCREEN_H,0);
     SDL_Renderer *renderer=SDL_CreateRenderer(window,-1,SDL_RENDERER_ACCELERATED|SDL_RENDERER_PRESENTVSYNC);
     TTF_Font *font=TTF_OpenFontRW(SDL_RWFromConstMem(font_data.address,(int)font_data.size),0,28);
@@ -901,7 +1167,7 @@ int main(void) {
     padConfigureInput(1,HidNpadStyleSet_NpadStandard); PadState pad; padInitializeDefault(&pad);hidInitializeTouchScreen();int touch_was_down=0;
     live_font=font;live_symbol=symbol;live_emoji=emoji;
     while(appletMainLoop()){
-        pump_network();padUpdate(&pad);u64 down=padGetButtonsDown(&pad)|read_touch_action(&touch_was_down);u64 held=padGetButtons(&pad);if(is_generating&&(down&HidNpadButton_B))cancel_requested=1;if(down&HidNpadButton_Plus){if(is_generating)finish_active_request(CURLE_ABORTED_BY_CALLBACK,1);break;}
+        pump_network();pump_image_downloads(renderer);padUpdate(&pad);u64 down=padGetButtonsDown(&pad)|read_touch_action(&touch_was_down);u64 held=padGetButtons(&pad);if(is_generating&&(down&HidNpadButton_B))cancel_requested=1;if(down&HidNpadButton_Plus){if(is_generating)finish_active_request(CURLE_ABORTED_BY_CALLBACK,1);break;}
         if(current_view==VIEW_CHAT){
             if(confirm_delete){if(down&HidNpadButton_A){delete_chat();confirm_delete=0;}if(down&HidNpadButton_B)confirm_delete=0;}
             else {if((down&HidNpadButton_L)&&chat_count>1)active_chat=(active_chat+chat_count-1)%chat_count;if((down&HidNpadButton_R)&&chat_count>1)active_chat=(active_chat+1)%chat_count;if(down&HidNpadButton_Left)sidebar_collapsed=1;if(down&HidNpadButton_Right)sidebar_collapsed=0;if(chat_count>0&&active_chat>=0){if(held&HidNpadButton_Up)scroll_velocity=-7.0f;if(held&HidNpadButton_Down)scroll_velocity=7.0f;HidAnalogStickState stick=padGetStickPos(&pad,0);if(stick.y>5000||stick.y<-5000)scroll_velocity=-(float)stick.y/2400.0f;if(!touch_was_down&&scroll_velocity!=0.0f){chats[active_chat].scroll_y+=(int)scroll_velocity;scroll_velocity*=0.88f;if(scroll_velocity>-0.35f&&scroll_velocity<0.35f)scroll_velocity=0.0f;}}else scroll_velocity=0.0f;if(down&HidNpadButton_ZL)rename_chat();if(down&HidNpadButton_X)add_chat();if((down&HidNpadButton_Y)&&chat_count>0&&!is_generating)confirm_delete=1;if(down&HidNpadButton_ZR){current_view=VIEW_SETTINGS;setting_row=0;}if(down&HidNpadButton_A){if(keyboard_input(draft_text,sizeof(draft_text),"输入消息",0))snprintf(status_text,sizeof(status_text),"内容已就绪，按 B 或轻触发送");}if((down&HidNpadButton_B)&&draft_text[0]&&!is_generating){char prompt[MESSAGE_SIZE];snprintf(prompt,sizeof(prompt),"%s",draft_text);draft_text[0]=0;send_chat(prompt);}}
@@ -910,5 +1176,5 @@ int main(void) {
         Theme theme=get_theme();if(current_view==VIEW_CHAT)draw_chat(renderer,font,small,theme);else if(current_view==VIEW_SETTINGS)draw_settings(renderer,font,small,theme);else draw_models(renderer,font,small,theme);SDL_RenderPresent(renderer);
     }
     if(is_generating)finish_active_request(CURLE_ABORTED_BY_CALLBACK,1);else cleanup_active_request();
-    save_config();save_sessions();destroy_bubble_cache();TTF_CloseFont(font);TTF_CloseFont(small);if(symbol)TTF_CloseFont(symbol);if(emoji)TTF_CloseFont(emoji);SDL_DestroyRenderer(renderer);SDL_DestroyWindow(window);TTF_Quit();SDL_Quit();curl_global_cleanup();socketExit();romfsExit();fsdevUnmountAll();return 0;
+    save_config();save_sessions();destroy_bubble_cache();cleanup_image_cache();TTF_CloseFont(font);TTF_CloseFont(small);if(symbol)TTF_CloseFont(symbol);if(emoji)TTF_CloseFont(emoji);SDL_DestroyRenderer(renderer);SDL_DestroyWindow(window);TTF_Quit();SDL_Quit();curl_global_cleanup();socketExit();romfsExit();fsdevUnmountAll();return 0;
 }

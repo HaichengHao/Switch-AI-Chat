@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-Switch AI Chat 0.9.3 is built with open-source devkitPro libraries. Those components remain under their own licenses; the repository's MIT license does not replace them.
+Switch AI Chat 0.9.4 is built with open-source devkitPro libraries. Those components remain under their own licenses; the repository's MIT license does not replace them.
 
 | Component | Version used for 0.9.3 | License |
 |---|---:|---|
@@ -16,8 +16,10 @@ Switch AI Chat 0.9.3 is built with open-source devkitPro libraries. Those compon
 | Mesa | 20.1.0 | MIT and other permissive licenses, depending on component |
 | libdrm_nouveau | 1.0.1 | MIT License |
 | Noto Emoji | bundled font | SIL Open Font License 1.1 |
+| stb_image | 2.30-compatible upstream source | Public Domain or MIT License |
 
 The complete SIL Open Font License for Noto Emoji is included at `romfs/OFL-NotoEmoji.txt` and embedded in the NRO RomFS.
+The stb_image dual-license text is included at `source/STB_LICENSE.txt`.
 
 ## Required notices
 
@@ -63,6 +65,7 @@ Upstream license sources:
 - <https://gitlab.freedesktop.org/mesa/mesa/-/blob/mesa-20.1.0/docs/license.rst>
 - <https://gitlab.freedesktop.org/mesa/drm/-/blob/main/README.rst>
 - <https://github.com/googlefonts/noto-emoji/blob/main/LICENSE>
+- <https://github.com/nothings/stb/blob/master/LICENSE>
 
 No Nintendo SDK, firmware, cryptographic keys, game files, logos, or other Nintendo-owned assets are included in this repository or its release packages.
 

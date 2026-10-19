@@ -10,7 +10,7 @@ LDFLAGS := -specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -L$(DEVKITPRO)/libn
 LIBS := -lcurl -lSDL2_ttf -lSDL2 -lEGL -lglapi -ldrm_nouveau -lharfbuzz -lfreetype -lbz2 -lpng16 -lz -lstdc++ -lm -lnx -lpthread
 APP_TITLE := Switch AI Chat
 APP_AUTHOR := hero
-APP_VERSION := 0.9.3
+APP_VERSION := 0.9.4
 APP_ICON := $(CURDIR)/icon.jpg
 ifneq ($(BUILD),$(notdir $(CURDIR)))
 export OUTPUT := $(CURDIR)/$(TARGET)

@@ -2,7 +2,7 @@
 
 ![Switch AI Chat icon](assets/switch-ai-chat-icon.png)
 
-一个面向 Nintendo Switch 自制软件环境的非官方、开源 AI 对话客户端。它通过用户自行提供的 OpenAI 兼容 API 与模型通信，支持流式回复、Markdown、会话管理、触屏操作和六套主题。
+一个面向 Nintendo Switch 自制软件环境的非官方、开源 AI 对话客户端。它通过用户自行提供的兼容 API 与模型通信，支持流式回复、Markdown、远程图片、联网搜索、会话管理、触屏操作和六套主题。
 
 > [!IMPORTANT]
 > 本项目是独立的社区自制软件，与 Nintendo Co., Ltd.、其关联公司以及任何 AI 服务提供商均无隶属、授权、赞助或认可关系。Nintendo Switch 是 Nintendo 的商标。本项目不包含 Nintendo SDK、固件、密钥、游戏内容、商标图形或其他专有素材，也不提供盗版、解密或规避版权保护的功能。请仅在你拥有并有权控制的设备上合法使用。
@@ -13,6 +13,8 @@
 - 用户自定义 Base URL、API Key 和模型
 - 获取服务端可用模型并直接点选
 - SSE 流式回复、停止生成和错误提示
+- 模型回复中的远程 Markdown 图片异步下载与显示（PNG、JPEG、GIF 首帧和 BMP）
+- 可持久化的联网搜索开关：MiniMax 自动使用 Responses Web Search，千问兼容接口使用 `enable_search`
 - Markdown 标题、粗体、列表、引用、代码块、表格及基础 Mermaid 流程图
 - 会话新建、删除、重命名、时间显示与本地持久化
 - 简体中文系统键盘、触屏和 Joy-Con 操作
@@ -37,7 +39,8 @@
 3. 选择 **API Key**，通过系统密码键盘输入自己的密钥。
 4. 选择 **获取可用模型**。应用会请求 `GET {Base URL}/models`。
 5. 从返回列表中选择模型并确认。
-6. 返回聊天页面，新建会话后即可发送消息。
+6. 如需实时资料，可在设置中开启“联网搜索”，或轻触聊天页右上角的联网搜索按钮。
+7. 返回聊天页面，新建会话后即可发送消息。
 
 如果返回 `HTTP 401`，通常表示 API Key 无效、已过期或没有权限。如果提示无法解析主机名，请检查 Base URL 拼写和网络连接。
 
@@ -54,10 +57,18 @@
 
 | 文件 | 用途 |
 |---|---|
-| `/switch/SwitchAIChat/config.ini` | Base URL、API Key、模型和主题；明文存储 |
+| `/switch/SwitchAIChat/config.ini` | Base URL、API Key、模型、主题和联网搜索开关；明文存储 |
 | `/switch/SwitchAIChat/sessions.bin` | 会话标题、消息和时间等本地历史记录 |
 
 本项目没有遥测、广告或开发者中转服务器。实际数据处理规则取决于用户选择的 API 服务商，请阅读对应服务商的隐私政策。
+
+## 联网搜索与图片
+
+- MiniMax：开启联网搜索后，应用调用 `{Base URL}/responses` 并启用 `web_search` 工具；关闭时仍使用 `/chat/completions`。
+- 千问 / Model Studio：应用继续调用 `/chat/completions`，并附加 `enable_search: true`。
+- 其他兼容服务：该服务若不认识 `enable_search`，可能返回参数错误；此时请关闭开关。联网搜索可能增加服务商计费。
+- 图片显示针对模型正文中的标准 Markdown 图片 `![说明](https://...)`，以及流式响应中的 `image_url.url`。这不是独立的文生图接口客户端。
+- 图片通过 HTTP(S) 直接下载，不携带你的 API Key；单张上限 5 MiB、最大解码尺寸 2048×2048 且不超过约 200 万像素。本地网络字面地址会被阻止。远程图片服务器仍可能看到你的公网 IP。
 
 ## 操作
 
@@ -70,6 +81,7 @@
 | 上一个 / 下一个会话 | `L` / `R` |
 | 重命名会话 | `ZL` 或轻触标题 |
 | 打开设置 | `ZR` 或侧栏“设置” |
+| 开关联网搜索 | 轻触聊天页“联网搜索”按钮，或在设置中切换 |
 | 收起 / 展开侧栏 | 十字键左 / 右 |
 | 滚动消息 | 十字键上 / 下、左摇杆或触屏拖动 |
 | 退出 | `+` |
@@ -87,7 +99,7 @@
 脚本会自动定位项目目录，并尝试从 `DEVKITPRO`、`D:\devkitPro` 或 `C:\devkitPro` 查找工具链。构建结果为项目根目录下的 `switch-ai-chat.nro`。
 
 ```text
-source/       正式 C/ASM 源码
+source/       正式 C/ASM 源码及 stb_image
 romfs/        Noto Emoji 字体及其许可证
 assets/       图标源文件
 ```

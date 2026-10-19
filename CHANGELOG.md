@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.4 - 2026-10-19
+
+- Added asynchronous rendering for remote Markdown images returned by models.
+- Added image download limits, basic local-network URL blocking, and API-key isolation for image requests.
+- Added a persistent, touch-accessible web-search toggle.
+- Added provider-aware search requests: MiniMax Responses Web Search and Qwen-compatible `enable_search`.
+- Added streaming parser support for Responses API `response.output_text.delta` events.
+- Kept the UI responsive while image downloads and model output are in progress.
+
 ## 0.9.3 - 2026-10-16
 
 First public open-source release.
